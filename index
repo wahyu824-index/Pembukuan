@@ -1,0 +1,420 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, query, orderBy, onSnapshot, doc, getDoc } from 'firebase/firestore';
+
+// Global variables provided by the Canvas environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Initialize Firebase App
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+// Transaction types for dropdown
+const transactionTypes = [
+  'Setoran Tunai',
+  'Tarik Tunai',
+  'Transfer',
+  'Pembayaran PLN',
+  'Pembayaran PDAM',
+  'Pembayaran BPJS',
+  'Pembelian Pulsa',
+  'Pembelian Paket Data',
+  'Pengeluaran Operasional', // For recording general expenses
+];
+
+function App() {
+  const [transactions, setTransactions] = useState([]);
+  const [date, setDate] = useState(new Date().toISOString().slice(0, 10)); // Current date
+  const [time, setTime] = useState(new Date().toTimeString().slice(0, 5));   // Current time
+  const [type, setType] = useState(transactionTypes[0]);
+  const [reference, setReference] = useState('');
+  const [amount, setAmount] = useState('');
+  const [fee, setFee] = useState('');
+  const [description, setDescription] = useState('');
+  const [currentBalance, setCurrentBalance] = useState(0);
+  const [totalFeeToday, setTotalFeeToday] = useState(0);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  // Authenticate user and listen for auth state changes
+  useEffect(() => {
+    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        setUserId(user.uid);
+      } else {
+        // Sign in anonymously if no custom token is provided
+        try {
+          if (initialAuthToken) {
+            await signInWithCustomToken(auth, initialAuthToken);
+          } else {
+            await signInAnonymously(auth);
+          }
+          setUserId(auth.currentUser.uid); // Set UID after sign-in
+        } catch (error) {
+          console.error("Firebase authentication error:", error);
+          // Fallback to a random ID if authentication fails
+          setUserId(crypto.randomUUID());
+        }
+      }
+      setIsAuthReady(true); // Authentication state is ready
+    });
+
+    return () => unsubscribeAuth();
+  }, []); // Run only once on component mount
+
+  // Fetch transactions when auth is ready and userId is set
+  useEffect(() => {
+    if (isAuthReady && userId) {
+      // Define the collection path based on userId for private data
+      const transactionsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/brilink_transactions`);
+      // Note: orderBy is commented out to avoid potential index issues as per instructions.
+      // Data will be sorted in-memory.
+      const q = query(transactionsCollectionRef);
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const fetchedTransactions = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+
+        // Sort transactions by date and time in descending order (newest first)
+        const sortedTransactions = fetchedTransactions.sort((a, b) => {
+          const dateTimeA = new Date(`${a.date}T${a.time}`);
+          const dateTimeB = new Date(`${b.date}T${b.time}`);
+          return dateTimeB - dateTimeA;
+        });
+
+        // Recalculate running balance and total fee after fetching/sorting
+        let balance = 0;
+        let todayFee = 0;
+        const updatedTransactions = sortedTransactions.map(tx => {
+          let kasMasuk = 0;
+          let kasKeluar = 0;
+
+          const principal = parseFloat(tx.amount || 0);
+          const adminFee = parseFloat(tx.fee || 0);
+
+          switch (tx.type) {
+            case 'Setoran Tunai':
+              kasMasuk = principal + adminFee;
+              break;
+            case 'Tarik Tunai':
+              kasKeluar = principal + adminFee;
+              break;
+            case 'Transfer':
+            case 'Pembayaran PLN':
+            case 'Pembayaran PDAM':
+            case 'Pembayaran BPJS':
+            case 'Pembelian Pulsa':
+            case 'Pembelian Paket Data':
+              kasMasuk = adminFee;
+              break;
+            case 'Pengeluaran Operasional':
+              kasKeluar = principal; // For operational expenses, amount is the expense
+              break;
+            default:
+              break;
+          }
+
+          balance += (kasMasuk - kasKeluar);
+          // Only add fee if it's a positive amount and relevant to today's date
+          if (tx.date === new Date().toISOString().slice(0, 10)) {
+            todayFee += adminFee;
+          }
+
+          return { ...tx, kasMasuk, kasKeluar, saldoAkhir: balance };
+        });
+
+        setTransactions(updatedTransactions.reverse()); // Reverse to display oldest first for running balance
+        setCurrentBalance(balance);
+        setTotalFeeToday(todayFee);
+      }, (error) => {
+        console.error("Error fetching transactions:", error);
+      });
+
+      return () => unsubscribe(); // Cleanup listener on unmount or userId change
+    }
+  }, [isAuthReady, userId]); // Re-run when auth state or userId changes
+
+  const addTransaction = async (e) => {
+    e.preventDefault();
+
+    if (!isAuthReady || !userId) {
+      console.error("Firestore not ready or user not authenticated.");
+      return;
+    }
+
+    const principal = parseFloat(amount || 0);
+    const adminFee = parseFloat(fee || 0);
+
+    let kasMasuk = 0;
+    let kasKeluar = 0;
+
+    switch (type) {
+      case 'Setoran Tunai':
+        kasMasuk = principal + adminFee;
+        break;
+      case 'Tarik Tunai':
+        kasKeluar = principal + adminFee;
+        break;
+      case 'Transfer':
+      case 'Pembayaran PLN':
+      case 'Pembayaran PDAM':
+      case 'Pembayaran BPJS':
+      case 'Pembelian Pulsa':
+      case 'Pembelian Paket Data':
+        kasMasuk = adminFee;
+        break;
+      case 'Pengeluaran Operasional':
+        kasKeluar = principal;
+        break;
+      default:
+        break;
+    }
+
+    const newTransaction = {
+      date,
+      time,
+      type,
+      reference,
+      amount: principal,
+      fee: adminFee,
+      description,
+      timestamp: new Date().toISOString(), // Use ISO string for reliable sorting in Firestore
+    };
+
+    try {
+      // Add transaction to Firestore
+      const transactionsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/brilink_transactions`);
+      await addDoc(transactionsCollectionRef, newTransaction);
+
+      // Reset form fields
+      setDate(new Date().toISOString().slice(0, 10));
+      setTime(new Date().toTimeString().slice(0, 5));
+      setType(transactionTypes[0]);
+      setReference('');
+      setAmount('');
+      setFee('');
+      setDescription('');
+    } catch (error) {
+      console.error("Error adding document: ", error);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-blue-100 to-indigo-200 p-4 font-inter text-gray-800">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <style>
+        {`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .table-container {
+          overflow-x: auto; /* Enable horizontal scrolling on small screens */
+        }
+        table {
+          min-width: 800px; /* Ensure table has a minimum width to prevent squishing */
+        }
+        @media (max-width: 640px) {
+          .table-header-cell, .table-data-cell {
+            padding: 8px 4px; /* Adjust padding for smaller screens */
+            font-size: 0.75rem; /* Smaller font size */
+          }
+          .form-input, .form-select, .form-textarea {
+            padding: 8px; /* Adjust padding for form inputs */
+          }
+        }
+        `}
+      </style>
+
+      <div className="max-w-4xl mx-auto bg-white rounded-xl shadow-lg p-6 md:p-8">
+        <h1 className="text-3xl md:text-4xl font-bold text-center text-blue-700 mb-6">
+          Pembukuan Usaha Brilink
+        </h1>
+        {userId && (
+          <p className="text-sm text-gray-600 text-center mb-4">
+            ID Pengguna Anda: <span className="font-mono bg-gray-100 px-2 py-1 rounded">{userId}</span>
+          </p>
+        )}
+
+        {/* Summary Section */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-8">
+          <div className="bg-blue-50 p-4 rounded-lg shadow-sm">
+            <h2 className="text-lg font-semibold text-blue-600 mb-2">Saldo Kas Saat Ini</h2>
+            <p className="text-2xl font-bold text-blue-800">
+              Rp {currentBalance.toLocaleString('id-ID')}
+            </p>
+          </div>
+          <div className="bg-green-50 p-4 rounded-lg shadow-sm">
+            <h2 className="text-lg font-semibold text-green-600 mb-2">Total Biaya Adm. Hari Ini</h2>
+            <p className="text-2xl font-bold text-green-800">
+              Rp {totalFeeToday.toLocaleString('id-ID')}
+            </p>
+          </div>
+        </div>
+
+        {/* Transaction Input Form */}
+        <form onSubmit={addTransaction} className="space-y-4 mb-8 p-4 border border-blue-200 rounded-lg shadow-md">
+          <h2 className="text-xl font-semibold text-blue-700 mb-4">Tambah Transaksi Baru</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="date" className="block text-sm font-medium text-gray-700">Tanggal</label>
+              <input
+                type="date"
+                id="date"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 form-input p-2"
+                required
+              />
+            </div>
+            <div>
+              <label htmlFor="time" className="block text-sm font-medium text-gray-700">Waktu</label>
+              <input
+                type="time"
+                id="time"
+                value={time}
+                onChange={(e) => setTime(e.target.value)}
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 form-input p-2"
+                required
+              />
+            </div>
+          </div>
+
+          <div>
+            <label htmlFor="type" className="block text-sm font-medium text-gray-700">Jenis Transaksi</label>
+            <select
+              id="type"
+              value={type}
+              onChange={(e) => setType(e.target.value)}
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 form-select p-2"
+              required
+            >
+              {transactionTypes.map((t) => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label htmlFor="reference" className="block text-sm font-medium text-gray-700">No. Referensi (Opsional)</label>
+            <input
+              type="text"
+              id="reference"
+              value={reference}
+              onChange={(e) => setReference(e.target.value)}
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 form-input p-2"
+              placeholder="Contoh: A123B456C789"
+            />
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="amount" className="block text-sm font-medium text-gray-700">Jumlah Pokok (Rp)</label>
+              <input
+                type="number"
+                id="amount"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 form-input p-2"
+                placeholder="Cth: 500000"
+                required={type !== 'Pengeluaran Operasional'} // Amount is optional for operational expenses if only fee is involved
+              />
+            </div>
+            <div>
+              <label htmlFor="fee" className="block text-sm font-medium text-gray-700">Biaya Adm. (Fee) (Rp)</label>
+              <input
+                type="number"
+                id="fee"
+                value={fee}
+                onChange={(e) => setFee(e.target.value)}
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 form-input p-2"
+                placeholder="Cth: 3000"
+                required={type !== 'Pengeluaran Operasional'} // Fee is optional for operational expenses
+              />
+            </div>
+          </div>
+
+          <div>
+            <label htmlFor="description" className="block text-sm font-medium text-gray-700">Keterangan (Opsional)</label>
+            <textarea
+              id="description"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              rows="2"
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 form-textarea p-2"
+              placeholder="Contoh: Setor ke Rekening Budi"
+            ></textarea>
+          </div>
+
+          <button
+            type="submit"
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+          >
+            Tambah Transaksi
+          </button>
+        </form>
+
+        {/* Transaction Table */}
+        <h2 className="text-xl font-semibold text-blue-700 mb-4">Riwayat Transaksi</h2>
+        <div className="table-container rounded-lg shadow-md overflow-hidden border border-blue-200">
+          <table className="w-full text-left text-sm bg-white">
+            <thead className="bg-blue-50 text-blue-700 uppercase">
+              <tr>
+                <th className="table-header-cell py-3 px-2 md:px-4">Tanggal & Waktu</th>
+                <th className="table-header-cell py-3 px-2 md:px-4">Jenis Transaksi</th>
+                <th className="table-header-cell py-3 px-2 md:px-4">Jumlah Pokok</th>
+                <th className="table-header-cell py-3 px-2 md:px-4">Biaya Adm.</th>
+                <th className="table-header-cell py-3 px-2 md:px-4">Kas Masuk</th>
+                <th className="table-header-cell py-3 px-2 md:px-4">Kas Keluar</th>
+                <th className="table-header-cell py-3 px-2 md:px-4">Saldo Akhir</th>
+                <th className="table-header-cell py-3 px-2 md:px-4">Keterangan</th>
+              </tr>
+            </thead>
+            <tbody>
+              {transactions.length === 0 ? (
+                <tr>
+                  <td colSpan="8" className="table-data-cell text-center py-4 text-gray-500">
+                    Belum ada transaksi. Silakan tambahkan transaksi baru.
+                  </td>
+                </tr>
+              ) : (
+                transactions.map((tx) => (
+                  <tr key={tx.id} className="border-b border-gray-200 hover:bg-gray-50">
+                    <td className="table-data-cell py-2 px-2 md:px-4">
+                      {tx.date} <br/> {tx.time}
+                    </td>
+                    <td className="table-data-cell py-2 px-2 md:px-4">{tx.type}</td>
+                    <td className="table-data-cell py-2 px-2 md:px-4 text-right">
+                      {parseFloat(tx.amount || 0).toLocaleString('id-ID')}
+                    </td>
+                    <td className="table-data-cell py-2 px-2 md:px-4 text-right">
+                      {parseFloat(tx.fee || 0).toLocaleString('id-ID')}
+                    </td>
+                    <td className="table-data-cell py-2 px-2 md:px-4 text-green-600 text-right">
+                      {tx.kasMasuk ? tx.kasMasuk.toLocaleString('id-ID') : '0'}
+                    </td>
+                    <td className="table-data-cell py-2 px-2 md:px-4 text-red-600 text-right">
+                      {tx.kasKeluar ? tx.kasKeluar.toLocaleString('id-ID') : '0'}
+                    </td>
+                    <td className="table-data-cell py-2 px-2 md:px-4 font-semibold text-right">
+                      {tx.saldoAkhir ? tx.saldoAkhir.toLocaleString('id-ID') : '0'}
+                    </td>
+                    <td className="table-data-cell py-2 px-2 md:px-4">
+                      {tx.description} {tx.reference && `(Ref: ${tx.reference})`}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;
